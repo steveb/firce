@@ -1,0 +1,2 @@
+scipy # BSD License
+numpy # BSD License

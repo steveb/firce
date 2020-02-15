@@ -1,0 +1,326 @@
+#!/usr/bin/env python
+
+import argparse
+from collections import namedtuple
+import os
+import re
+import sys
+
+from scipy.io import wavfile
+
+URI_PREFIX = "https://github.com/steveb/firce"
+FAUSTARCH = "lv2.cpp"
+
+MAKEFILE_TEMPLATE = """
+URI_PREFIX = {namespace}
+FAUSTARCH = lv2.cpp
+FAUSTLIB_SEARCH = /usr/share/faust/$(FAUSTARCH) /usr/local/share/faust/$(FAUSTARCH)
+FAUSTLIB = $(shell dirname `ls -f $(FAUSTLIB_SEARCH) 2>/dev/null | tail -1`)
+FAUSTINC = $(subst share,include,$(FAUSTLIB))
+FAUSTTOOLSFLAGS =
+
+PROCARCH = -fPIC
+CXXFLAGS = -O3 -std=c++11 -ffast-math -ftree-vectorize
+CXX = g++
+CPPFLAGS = -DURI_PREFIX=\\"$(URI_PREFIX)\\" -DFAUST_META=1 -DFAUST_MIDICC=0 -DFAUST_MTS=0
+
+all: {name}.so
+
+{name}.so: {name}.cpp
+	$(CXX) -shared $(CXXFLAGS) $(FAUSTTOOLSFLAGS) $(PROCARCH) $(CPPFLAGS) $^ -o $@
+
+{name}.cpp: {name}.dsp
+	faust -i --timeout 3600 -a "$(FAUSTLIB)/$(FAUSTARCH)" -cn $* $< -o $@
+
+clean:
+	rm -f {name}.cpp {name}.so
+
+"""
+
+NAMESPACE = "https://github.com/steveb/firce"
+
+DSP_TEMPLATE = """
+// Generated with:
+//   {args}
+// See {namespace}
+ba = library("basics.lib");
+fi = library("filters.lib");
+si = library("signals.lib");
+
+i = nentry("ir [name: Impulse Response][style:menu{{{options}}}]",0,0,{option_max},1);
+
+gain = hslider("gain [name: Gain]",1,0,2,0.01);
+generalGain = gain : ba.lin2LogGain : si.smoo;
+
+process = _ <: {firs} : ba.selectn({wavlen}, i) * generalGain : _ ;
+"""
+
+
+MANIFEST_TEMPLATE = """
+@prefix doap: <http://usefulinc.com/ns/doap#> .
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .
+@prefix lv2:  <http://lv2plug.in/ns/lv2core#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+<{namespace}/{name}>
+    a lv2:Plugin ;
+    lv2:binary <{name}.so> ;
+    rdfs:seeAlso <{name}.ttl> , <modgui.ttl> .
+"""
+
+
+MANIFEST_UI_TEMPLATE = '''
+@prefix doap:  <http://usefulinc.com/ns/doap#> .
+@prefix foaf:  <http://xmlns.com/foaf/0.1/> .
+@prefix lv2:   <http://lv2plug.in/ns/lv2core#> .
+@prefix ui:    <http://lv2plug.in/ns/extensions/ui#> .
+@prefix epp:   <http://lv2plug.in/ns/ext/port-props#> .
+@prefix atom:  <http://lv2plug.in/ns/ext/atom#> .
+@prefix rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix units: <http://lv2plug.in/ns/extensions/units#> .
+<{namespace}/{name}>
+       a lv2:Plugin , lv2:SimulatorPlugin ;
+       doap:name "{title}" ;
+       lv2:binary <{name}.so> ;
+       lv2:optionalFeature epp:supportsStrictBounds ;
+       lv2:optionalFeature lv2:hardRtCapable ;
+rdfs:comment """
+An Impulse Response plugin with the following impulses:
+{ir_list}
+""";
+    lv2:port [
+	a lv2:InputPort ;
+	a lv2:ControlPort ;
+	lv2:index 1 ;
+	lv2:symbol "gain_0" ;
+	lv2:name "Gain" ;
+        lv2:portProperty epp:hasStrictBounds ;
+        epp:rangeSteps 200 ;
+	lv2:default 1 ;
+	lv2:minimum 0 ;
+	lv2:maximum 2 ;
+    ] , [
+	a lv2:InputPort ;
+	a lv2:ControlPort ;
+	lv2:index 0 ;
+	lv2:symbol "ir_1" ;
+	lv2:name "Impulse Response" ;
+        lv2:portProperty epp:hasStrictBounds ;
+        epp:rangeSteps {option_max} ;
+	lv2:default 0 ;
+	lv2:minimum 0 ;
+	lv2:maximum {option_max} ;
+    lv2:portProperty lv2:integer;
+    lv2:portProperty lv2:enumeration ;
+{options}
+    ] , [
+	a lv2:InputPort ;
+	a lv2:AudioPort ;
+	lv2:index 2 ;
+	lv2:symbol "in0" ;
+	lv2:name "in0" ;
+    ] , [
+	a lv2:OutputPort ;
+	a lv2:AudioPort ;
+	lv2:index 3 ;
+	lv2:symbol "out0" ;
+	lv2:name "out0" ;
+    ]
+.
+'''
+
+MANIFEST_MODUI_TEMPLATE = """
+@prefix modgui: <http://moddevices.com/ns/modgui#> .
+@prefix lv2:    <http://lv2plug.in/ns/lv2core#> .
+
+<{namespace}/{name}>
+    modgui:gui [
+        modgui:resourcesDirectory <modgui> ;
+        modgui:brand "Gula" ;
+        modgui:label "{title}" ;
+        modgui:model "boxy" ;
+        modgui:panel "1-select-1-knob" ;
+        modgui:color "zinc" ;
+        modgui:knob "black" ;
+        modgui:port [
+            lv2:index 0 ;
+            lv2:symbol "ir_1" ;
+            lv2:name "Impulse Response" ;
+        ] , [
+            lv2:index 1 ;
+            lv2:symbol "gain_0" ;
+            lv2:name "Gain" ;
+        ] ;
+    ] .
+"""
+
+args = None
+
+
+def name_type(arg_value):
+    if not arg_value.isidentifier():
+        raise argparse.ArgumentTypeError(
+            "%s not a valid identifier" % arg_value
+        )
+    return arg_value
+
+
+def buildargs():
+    global args
+    parser = argparse.ArgumentParser(
+        description="Generates impulse response LV2 plugins from audio files",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "args",
+        metavar="<file path>",
+        nargs="*",
+        help="Path to wav files to use as impulse responses",
+    )
+    parser.add_argument(
+        "--output-path",
+        metavar="<directory path>",
+        required=True,
+        help="Path to write LV2 plugin to.",
+    )
+    parser.add_argument(
+        "--limit",
+        default=1024,
+        type=int,
+        help="Number of samples to truncate the wav data to",
+    )
+    parser.add_argument(
+        "--name",
+        type=name_type,
+        required=True,
+        help="Name of LV2 plugin to generate (must be a valid identifier, "
+        "no spaces or hyphens)",
+    )
+    parser.add_argument(
+        "--title", required=True, help="Title of LV2 plugin to generate"
+    )
+
+    args = parser.parse_args(sys.argv[1:])
+
+
+def write_dsp(f, wavs):
+    firs = [w.slug for w in wavs]
+    options = ["'%s':%d" % (w.title, w.index) for w in wavs]
+    f.write(
+        DSP_TEMPLATE.format(
+            args=" ".join(sys.argv),
+            options=";".join(options),
+            option_max=len(options) - 1,
+            wavlen=len(options),
+            firs=", ".join(firs),
+            namespace=NAMESPACE,
+        )
+    )
+    for i in wavs:
+        wav_to_fir(f, i.slug, i.filename, args.limit)
+
+
+def write_manifest(f):
+    f.write(MANIFEST_TEMPLATE.format(namespace=NAMESPACE, name=args.name))
+
+
+def write_modgui(f):
+    f.write(
+        MANIFEST_MODUI_TEMPLATE.format(
+            namespace=NAMESPACE, name=args.name, title=args.title
+        )
+    )
+
+
+def write_makefile(f):
+    f.write(
+        MAKEFILE_TEMPLATE.format(
+            namespace=NAMESPACE, name=args.name, title=args.title
+        )
+    )
+
+
+def write_manifest_ui(f, wavs):
+    otempl = '    lv2:scalePoint [rdfs:label "{title}"; rdf:value {index}];'
+
+    def options():
+        for w in wavs:
+            yield otempl.format(title=w.title, index=w.index)
+
+    f.write(
+        MANIFEST_UI_TEMPLATE.format(
+            namespace=NAMESPACE,
+            name=args.name,
+            title=args.title,
+            ir_list="\n".join([w.title for w in wavs]),
+            option_max=len(wavs) - 1,
+            options="\n".join(options()),
+        )
+    )
+
+
+def wav_to_fir(f, fir_name, wav_file, limit=0):
+    f.write("%s = fi.fir((" % fir_name)
+    samplerate, data = wavfile.read(wav_file)
+    if limit:
+        data = data[:limit]
+    if data.dtype == "int16":
+        data = data.astype("float32") / 32767.0
+    elif data.dtype == "int32":
+        data = data.astype("float32") / 2147483647.0
+    elif data.dtype == "float":
+        data = data.astype("float32")
+    elif data.dtype == "float32":
+        pass
+    else:
+        raise Exception("Cannot handle data type %s" % data.dtype)
+    f.write(", ".join(data.astype(str)))
+    f.write("));\n\n")
+
+
+def file_to_title(file):
+    filename = os.path.split(file)[-1]
+    wavname = os.path.splitext(filename)[0]
+    return wavname.replace("_", " ")
+
+
+def args_to_wavs(args):
+    Wav = namedtuple("Wav", "slug, filename, title, index")
+    i = 0
+    for a in args:
+        yield Wav(slug="f%d" % i, filename=a, title=file_to_title(a), index=i)
+        i = i + 1
+
+
+def create_plugin():
+    lv2_dir = os.path.join(args.output_path, args.name + ".lv2")
+    if not os.path.isdir(lv2_dir):
+        os.makedirs(lv2_dir)
+
+    wavs = list(args_to_wavs(args.args))
+
+    dsp_file = os.path.join(lv2_dir, args.name + ".dsp")
+    with open(dsp_file, mode="w+") as f:
+        write_dsp(f, wavs)
+
+    manifest_file = os.path.join(lv2_dir, "manifest.ttl")
+    with open(manifest_file, mode="w+") as f:
+        write_manifest(f)
+
+    manifest_ui_file = os.path.join(lv2_dir, args.name + ".ttl")
+    with open(manifest_ui_file, mode="w+") as f:
+        write_manifest_ui(f, wavs)
+
+    modgui_file = os.path.join(lv2_dir, "modgui.ttl")
+    with open(modgui_file, mode="w+") as f:
+        write_modgui(f)
+
+    makefile = os.path.join(lv2_dir, "Makefile")
+    with open(makefile, mode="w+") as f:
+        write_makefile(f)
+
+
+if __name__ == "__main__":
+    buildargs()
+    create_plugin()
