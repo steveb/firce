@@ -52,7 +52,7 @@ i = nentry("ir [name: Impulse Response][style:menu{{{options}}}]",0,0,{option_ma
 gain = hslider("gain [name: Gain][unit: dB]",0,-40,40,0.1);
 generalGain = gain : ba.db2linear : si.smoo;
 
-process = _ <: {firs} : ba.selectn({wavlen}, i) * generalGain : _ ;
+process = _ * generalGain : ba.selectoutn({wavlen}, i) : {firs} : ba.selectn({wavlen}, i) : _ ;
 """
 
 
