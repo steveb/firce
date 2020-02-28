@@ -49,10 +49,7 @@ si = library("signals.lib");
 
 i = nentry("ir [name: Impulse Response][style:menu{{{options}}}]",0,0,{option_max},1);
 
-gain = hslider("gain [name: Gain][unit: dB]",0,-40,40,0.1);
-generalGain = gain : ba.db2linear : si.smoo;
-
-process = _ * generalGain : ba.selectoutn({wavlen}, i) : {firs} : ba.selectn({wavlen}, i) : _ ;
+process = _ : ba.selectoutn({wavlen}, i) : {firs} : ba.selectn({wavlen}, i) : _ ;
 """
 
 
@@ -85,6 +82,8 @@ MANIFEST_UI_TEMPLATE = '''
        lv2:binary <{name}.so> ;
        lv2:optionalFeature epp:supportsStrictBounds ;
        lv2:optionalFeature lv2:hardRtCapable ;
+       doap:maintainer [ foaf:name "FIRCE" ] ;
+       doap:revision "1.0.0" ;
 rdfs:comment """
 An Impulse Response plugin with the following impulses:
 {ir_list}
@@ -92,23 +91,11 @@ An Impulse Response plugin with the following impulses:
     lv2:port [
 	a lv2:InputPort ;
 	a lv2:ControlPort ;
-	lv2:index 1 ;
-	lv2:symbol "gain_0" ;
-	lv2:name "Gain" ;
-        lv2:portProperty epp:hasStrictBounds ;
-        epp:rangeSteps 200 ;
-    lv2:default 0.0;
-    lv2:minimum -40.0;
-    lv2:maximum 40.0;
-    units:unit units:db ;
-    ] , [
-	a lv2:InputPort ;
-	a lv2:ControlPort ;
 	lv2:index 0 ;
 	lv2:symbol "ir_1" ;
 	lv2:name "Impulse Response" ;
         lv2:portProperty epp:hasStrictBounds ;
-        epp:rangeSteps {option_max} ;
+        epp:rangeSteps {steps} ;
 	lv2:default 0 ;
 	lv2:minimum 0 ;
 	lv2:maximum {option_max} ;
@@ -118,13 +105,13 @@ An Impulse Response plugin with the following impulses:
     ] , [
 	a lv2:InputPort ;
 	a lv2:AudioPort ;
-	lv2:index 2 ;
+	lv2:index 1 ;
 	lv2:symbol "in0" ;
 	lv2:name "in0" ;
     ] , [
 	a lv2:OutputPort ;
 	a lv2:AudioPort ;
-	lv2:index 3 ;
+	lv2:index 2 ;
 	lv2:symbol "out0" ;
 	lv2:name "out0" ;
     ]
@@ -138,20 +125,16 @@ MANIFEST_MODUI_TEMPLATE = """
 <{namespace}/{name}>
     modgui:gui [
         modgui:resourcesDirectory <modgui> ;
-        modgui:brand "Gula" ;
+        modgui:brand "Firce" ;
         modgui:label "{title}" ;
         modgui:model "boxy" ;
         modgui:panel "1-select-1-knob" ;
         modgui:color "zinc" ;
-        modgui:knob "black" ;
+        modgui:knob "aluminium" ;
         modgui:port [
             lv2:index 0 ;
             lv2:symbol "ir_1" ;
             lv2:name "Impulse Response" ;
-        ] , [
-            lv2:index 1 ;
-            lv2:symbol "gain_0" ;
-            lv2:name "Gain" ;
         ] ;
     ] .
 """
@@ -207,7 +190,9 @@ def buildargs():
 
 def write_dsp(f, wavs):
     firs = [w.slug for w in wavs]
+    firs.insert(0, '_')
     options = ["'%s':%d" % (w.title, w.index) for w in wavs]
+    options.insert(0, "'None':0")
     f.write(
         DSP_TEMPLATE.format(
             args=" ".join(sys.argv),
@@ -246,6 +231,7 @@ def write_manifest_ui(f, wavs):
     otempl = '    lv2:scalePoint [rdfs:label "{title}"; rdf:value {index}];'
 
     def options():
+        yield otempl.format(title='None', index=0)
         for w in wavs:
             yield otempl.format(title=w.title, index=w.index)
 
@@ -255,8 +241,9 @@ def write_manifest_ui(f, wavs):
             name=args.name,
             title=args.title,
             ir_list="\n".join([w.title for w in wavs]),
-            option_max=len(wavs) - 1,
+            option_max=len(wavs),
             options="\n".join(options()),
+            steps=len(wavs) + 1,
         )
     )
 
@@ -288,7 +275,7 @@ def file_to_title(file):
 
 def args_to_wavs(args):
     Wav = namedtuple("Wav", "slug, filename, title, index")
-    i = 0
+    i = 1
     for a in args:
         yield Wav(slug="f%d" % i, filename=a, title=file_to_title(a), index=i)
         i = i + 1
